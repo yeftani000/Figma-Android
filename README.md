@@ -27,3 +27,13 @@ Personal-use multi-tab WebView wrapper around figma.com. Not affiliated with Fig
 
 All other keys (V, R, F, Ctrl+C/Z/D, etc.) pass through to the Figma editor,
 which handles its own shortcuts. To change the tab shortcuts, edit `shortcutFor()` in MainActivity.kt.
+
+## Pen / stylus (tested on nothing yet - built for Xiaomi Focus Pen Pro style active pens)
+Tap the pen icon at the top right to open Pen settings:
+- **Palm rejection:** finger touches that start while the pen is touching or hovering (within 0.5 s) are ignored.
+  Turn it off if you want to pan/zoom with a finger while the pen is nearby.
+- **Pen button = hold Space (pan):** holding the pen's side button holds Space in Figma, so pen-drag pans the canvas.
+  The button is hidden from the page so it doesn't trigger a right-click menu.
+- **Keep screen on while editing:** on file tabs only.
+Long-press menus and haptics are disabled so holding the pen still doesn't pop up menus.
+Pressure/tilt/hover are passed to Figma by the WebView as standard pointer events.
