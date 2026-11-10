@@ -1,6 +1,22 @@
 package com.example.figmawrapper
 
 import android.annotation.SuppressLint
+import android.text.InputType
+import android.widget.CheckBox
+import android.widget.EditText
+import android.widget.ScrollView
+import android.app.DownloadManager
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.IntentFilter
+import android.os.Environment
+import android.provider.Settings
+import android.widget.Toast
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.graphics.Color
@@ -37,14 +53,17 @@ import org.json.JSONObject
 
 class MainActivity : AppCompatActivity() {
 
-    private class Tab(val webView: WebView, val isHome: Boolean) {
-        var title: String = if (isHome) "Home" else "Figma"
+    private class Tab(val webView: WebView, val isHome: Boolean, val isFigCraft: Boolean = false) {
+        val pinned: Boolean get() = isHome || isFigCraft
+        var title: String = if (isHome) "Home" else if (isFigCraft) "FigCraft" else "Figma"
         var url: String? = null          // last known URL (used for saving / reopening)
         var pendingUrl: String? = null   // loaded lazily the first time the tab is shown
     }
 
     private companion object {
         const val HOME_URL = "https://www.figma.com/files"
+        const val REPO = "yeftani000/Figma-Android"   // GitHub releases are checked here
+        const val UPDATE_CHECK_INTERVAL_MS = 12L * 60 * 60 * 1000
         const val DESKTOP_UA =
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -65,11 +84,20 @@ class MainActivity : AppCompatActivity() {
     private var palmRejection = true
     private var barrelPan = true
     private var keepAwake = true
+    private var figcraftEnabled = false
+    private var figcraftEager = true
+    private var figcraftUrl = ""
 
     // Pen runtime state
     private var lastPenTime = 0L
     private var rejectingGesture = false
     private var spaceHeld = false
+
+    // Updates
+    private var downloadId = -1L
+    private val versionName: String by lazy {
+        try { packageManager.getPackageInfo(packageName, 0).versionName ?: "0" } catch (_: Exception) { "0" }
+    }
 
     private lateinit var tabStrip: LinearLayout
     private lateinit var tabScroll: HorizontalScrollView
@@ -99,12 +127,20 @@ class MainActivity : AppCompatActivity() {
         restoreTabs()
         intent?.data?.let { openInNewTab(it.toString()) }
 
+        ContextCompat.registerReceiver(
+            this, downloadReceiver,
+            IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
+            ContextCompat.RECEIVER_EXPORTED
+        )
+        autoCheckForUpdates()
+
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 val t = current ?: run { finish(); return }
                 when {
                     t.webView.canGoBack() -> t.webView.goBack()
-                    !t.isHome -> closeTab(t)
+                    !t.pinned -> closeTab(t)
+                    t.isFigCraft -> switchTo(tabs[0])
                     else -> finish()
                 }
             }
@@ -123,6 +159,11 @@ class MainActivity : AppCompatActivity() {
         super.onPause()
     }
 
+    override fun onDestroy() {
+        try { unregisterReceiver(downloadReceiver) } catch (_: Exception) {}
+        super.onDestroy()
+    }
+
     // ---------------------------------------------------------------- settings
 
     private fun loadSettings() {
@@ -130,6 +171,9 @@ class MainActivity : AppCompatActivity() {
         palmRejection = p.getBoolean("palm", true)
         barrelPan = p.getBoolean("barrel", true)
         keepAwake = p.getBoolean("awake", true)
+        figcraftEnabled = p.getBoolean("fc_on", false)
+        figcraftEager = p.getBoolean("fc_eager", true)
+        figcraftUrl = p.getString("fc_url", "") ?: ""
     }
 
     private fun saveSettings() {
@@ -137,27 +181,64 @@ class MainActivity : AppCompatActivity() {
             .putBoolean("palm", palmRejection)
             .putBoolean("barrel", barrelPan)
             .putBoolean("awake", keepAwake)
+            .putBoolean("fc_on", figcraftEnabled)
+            .putBoolean("fc_eager", figcraftEager)
+            .putString("fc_url", figcraftUrl)
             .apply()
     }
 
-    private fun showPenSettings() {
-        val labels = arrayOf(
-            "Palm rejection (ignore touch while the pen is near)",
-            "Pen button = hold Space (pan)",
-            "Keep screen on while editing"
-        )
-        val checked = booleanArrayOf(palmRejection, barrelPan, keepAwake)
+    private fun showSettings() {
+        fun cb(text: String, on: Boolean) = CheckBox(this).apply { this.text = text; isChecked = on }
+        fun header(text: String) = TextView(this).apply {
+            this.text = text
+            textSize = 12f
+            alpha = 0.7f
+            setPadding(0, dp(14), 0, dp(2))
+        }
+        val palm = cb("Palm rejection (ignore touch while the pen is near)", palmRejection)
+        val barrel = cb("Pen button = hold Space (pan)", barrelPan)
+        val awake = cb("Keep screen on while editing", keepAwake)
+        val fcOn = cb("Show FigCraft tab (Figma alternative)", figcraftEnabled)
+        val fcEager = cb("Load it at startup, alongside Figma (uses more memory)", figcraftEager)
+        val fcUrl = EditText(this).apply {
+            hint = "FigCraft web URL (https://...)"
+            setText(figcraftUrl)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            setSingleLine()
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), 0)
+            addView(header("PEN"))
+            addView(palm)
+            addView(barrel)
+            addView(header("EDITING"))
+            addView(awake)
+            addView(header("FIGCRAFT"))
+            addView(fcOn)
+            addView(fcEager)
+            addView(fcUrl)
+        }
         AlertDialog.Builder(this)
-            .setTitle("Pen settings")
-            .setMultiChoiceItems(labels, checked) { _, which, isChecked ->
-                when (which) {
-                    0 -> palmRejection = isChecked
-                    1 -> { barrelPan = isChecked; if (!isChecked) setSpace(false) }
-                    2 -> { keepAwake = isChecked; applyKeepAwake() }
-                }
+            .setTitle("Settings  \u00b7  v$versionName")
+            .setView(ScrollView(this).apply { addView(box) })
+            .setPositiveButton("Done") { _, _ ->
+                palmRejection = palm.isChecked
+                barrelPan = barrel.isChecked
+                if (!barrelPan) setSpace(false)
+                keepAwake = awake.isChecked
+                applyKeepAwake()
+
+                val url = fcUrl.text.toString().trim()
+                val valid = url.startsWith("https://") || url.startsWith("http://")
+                if (fcOn.isChecked && !valid) toast("Enter a FigCraft URL starting with http:// or https://")
+                figcraftUrl = url
+                figcraftEager = fcEager.isChecked
+                figcraftEnabled = fcOn.isChecked && valid
                 saveSettings()
+                applyFigCraft()
             }
-            .setPositiveButton("Done", null)
+            .setNeutralButton("Check for updates") { _, _ -> checkForUpdates(true) }
             .show()
     }
 
@@ -188,18 +269,22 @@ class MainActivity : AppCompatActivity() {
             isHorizontalScrollBarEnabled = false
             addView(tabStrip, FrameLayout.LayoutParams(WRAP_CONTENT, MATCH_PARENT))
         }
+        val reload = icon(R.drawable.ic_refresh, TEXT_ON, 7).apply {
+            setOnClickListener { reloadCurrent() }
+        }
         val plus = icon(R.drawable.ic_add, TEXT_ON, 7).apply {
             setOnClickListener { openInNewTab(HOME_URL) }
         }
-        val pen = icon(R.drawable.ic_pen, TEXT_ON, 7).apply {
-            setOnClickListener { showPenSettings() }
+        val gear = icon(R.drawable.ic_settings, TEXT_ON, 7).apply {
+            setOnClickListener { showSettings() }
         }
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(BAR)
             addView(tabScroll, LinearLayout.LayoutParams(0, dp(30), 1f))
+            addView(reload, LinearLayout.LayoutParams(dp(32), dp(30)))
             addView(plus, LinearLayout.LayoutParams(dp(32), dp(30)))
-            addView(pen, LinearLayout.LayoutParams(dp(32), dp(30)))
+            addView(gear, LinearLayout.LayoutParams(dp(32), dp(30)))
         }
         content = FrameLayout(this)
         val root = LinearLayout(this).apply {
@@ -230,6 +315,14 @@ class MainActivity : AppCompatActivity() {
             if (tab.isHome) {
                 // Icon-only Home tab to save width
                 chip.addView(icon(R.drawable.ic_home, tint, 5), LinearLayout.LayoutParams(dp(32), dp(26)))
+            } else if (tab.isFigCraft) {
+                chip.addView(TextView(this).apply {
+                    text = "FigCraft"
+                    textSize = 12f
+                    maxLines = 1
+                    setTextColor(tint)
+                    setPadding(dp(10), 0, dp(10), 0)
+                })
             } else {
                 val label = TextView(this).apply {
                     text = tab.title
@@ -256,7 +349,7 @@ class MainActivity : AppCompatActivity() {
     // ---------------------------------------------------------------- tabs
 
     @SuppressLint("SetJavaScriptEnabled")
-    private fun createTab(isHome: Boolean): Tab {
+    private fun createTab(isHome: Boolean, isFigCraft: Boolean = false): Tab {
         val wv = WebView(this)
         wv.settings.apply {
             javaScriptEnabled = true
@@ -279,11 +372,11 @@ class MainActivity : AppCompatActivity() {
         wv.overScrollMode = View.OVER_SCROLL_NEVER
 
         CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
-        val tab = Tab(wv, isHome)
+        val tab = Tab(wv, isHome, isFigCraft)
         wv.tag = tab
         wv.webViewClient = client
         wv.webChromeClient = chromeClient
-        wv.visibility = View.GONE
+        wv.visibility = View.INVISIBLE   // INVISIBLE keeps its size, so canvas apps can load in the background
         content.addView(wv, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
         tabs.add(tab)
         return tab
@@ -298,7 +391,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun switchTo(tab: Tab) {
         setSpace(false)
-        for (t in tabs) t.webView.visibility = if (t === tab) View.VISIBLE else View.GONE
+        for (t in tabs) t.webView.visibility = if (t === tab) View.VISIBLE else View.INVISIBLE
         current = tab
         tab.pendingUrl?.let { tab.pendingUrl = null; tab.webView.loadUrl(it) }
         tab.webView.requestFocus()
@@ -308,7 +401,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun closeTab(tab: Tab) {
-        if (tab.isHome) return
+        if (tab.pinned) return
         val idx = tabs.indexOf(tab)
         if (idx < 0) return
         tab.url?.takeIf { it.isNotBlank() && it != "about:blank" }?.let {
@@ -327,6 +420,43 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun addFigCraftTab() {
+        val t = createTab(false, true)
+        // keep it right after Home
+        tabs.remove(t)
+        tabs.add(1.coerceAtMost(tabs.size), t)
+        t.url = figcraftUrl
+        if (figcraftEager) t.webView.loadUrl(figcraftUrl) else t.pendingUrl = figcraftUrl
+    }
+
+    private fun removeFigCraftTab() {
+        val t = tabs.firstOrNull { it.isFigCraft } ?: return
+        tabs.remove(t)
+        content.removeView(t.webView)
+        t.webView.stopLoading()
+        t.webView.destroy()
+        if (current === t) switchTo(tabs[0]) else { refreshTabBar(); saveTabs() }
+    }
+
+    /** Called after Settings: add, remove or re-point the FigCraft tab. */
+    private fun applyFigCraft() {
+        val existing = tabs.firstOrNull { it.isFigCraft }
+        if (!figcraftEnabled) { removeFigCraftTab(); return }
+        if (existing == null) {
+            addFigCraftTab()
+            refreshTabBar()
+        } else if (existing.url != figcraftUrl) {
+            existing.url = figcraftUrl
+            existing.pendingUrl = figcraftUrl
+            if (current === existing) switchTo(existing)
+        }
+    }
+
+    private fun reloadCurrent() {
+        val t = current ?: return
+        if (t.webView.url.isNullOrBlank()) t.webView.loadUrl(t.url ?: HOME_URL) else t.webView.reload()
+    }
+
     private fun reopenClosedTab() {
         closedUrls.removeLastOrNull()?.let { openInNewTab(it) }
     }
@@ -340,7 +470,7 @@ class MainActivity : AppCompatActivity() {
     private fun saveTabs() {
         val arr = JSONArray()
         for (t in tabs) {
-            if (t.isHome) continue
+            if (t.pinned) continue
             val u = t.url
             if (u.isNullOrBlank() || u == "about:blank") continue
             arr.put(JSONObject().put("url", u).put("title", t.title))
@@ -355,6 +485,7 @@ class MainActivity : AppCompatActivity() {
         val home = createTab(true)
         home.pendingUrl = HOME_URL
         home.url = HOME_URL
+        if (figcraftEnabled && figcraftUrl.isNotBlank()) addFigCraftTab()
         val prefs = getSharedPreferences("tabs", MODE_PRIVATE)
         try {
             val arr = JSONArray(prefs.getString("tabs", "[]"))
@@ -383,7 +514,9 @@ class MainActivity : AppCompatActivity() {
             val tab = view.tag as? Tab ?: return false
             val uri = request.url
 
-            if (!isFigmaHost(uri.host)) {
+            val allowed = if (tab.isFigCraft) uri.host != null && uri.host == Uri.parse(figcraftUrl).host
+                          else isFigmaHost(uri.host)
+            if (!allowed) {
                 try { startActivity(Intent(Intent.ACTION_VIEW, uri)) } catch (_: ActivityNotFoundException) {}
                 if (!tab.isHome && (view.url.isNullOrBlank() || view.url == "about:blank")) {
                     view.post { closeTab(tab) }
@@ -419,7 +552,7 @@ class MainActivity : AppCompatActivity() {
     private val chromeClient = object : WebChromeClient() {
         override fun onReceivedTitle(view: WebView, title: String?) {
             val tab = view.tag as? Tab ?: return
-            if (tab.isHome || !tabs.contains(tab)) return
+            if (tab.pinned || !tabs.contains(tab)) return
             val clean = (title ?: "").replace(Regex("\\s*[\u2013\u2014-]\\s*Figma$"), "").trim()
             tab.title = clean.ifEmpty { "Figma" }
             refreshTabBar()
@@ -447,6 +580,122 @@ class MainActivity : AppCompatActivity() {
             filePicker.launch(params.createIntent())
             return true
         }
+    }
+
+    // ---------------------------------------------------------------- updates (GitHub releases)
+
+    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+
+    private fun numbers(v: String) = Regex("\\d+").findAll(v).map { it.value.toIntOrNull() ?: 0 }.toList()
+
+    private fun isNewer(latest: String, installed: String): Boolean {
+        val a = numbers(latest)
+        val b = numbers(installed)
+        for (i in 0 until maxOf(a.size, b.size)) {
+            val x = a.getOrElse(i) { 0 }
+            val y = b.getOrElse(i) { 0 }
+            if (x != y) return x > y
+        }
+        return false
+    }
+
+    private fun autoCheckForUpdates() {
+        val p = getSharedPreferences("settings", MODE_PRIVATE)
+        val now = System.currentTimeMillis()
+        if (now - p.getLong("lastUpdateCheck", 0L) < UPDATE_CHECK_INTERVAL_MS) return
+        p.edit().putLong("lastUpdateCheck", now).apply()
+        checkForUpdates(false)
+    }
+
+    private fun checkForUpdates(manual: Boolean) {
+        if (manual) toast("Checking for updates\u2026")
+        Thread {
+            try {
+                val conn = (URL("https://api.github.com/repos/$REPO/releases/latest").openConnection() as HttpURLConnection).apply {
+                    setRequestProperty("Accept", "application/vnd.github+json")
+                    connectTimeout = 10000
+                    readTimeout = 10000
+                }
+                if (conn.responseCode == 404) {
+                    if (manual) runOnUiThread { toast("No releases published yet") }
+                    return@Thread
+                }
+                val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
+                val tag = json.getString("tag_name")
+                val notes = if (json.isNull("body")) "" else json.getString("body")
+                var apkUrl: String? = null
+                val assets = json.getJSONArray("assets")
+                for (i in 0 until assets.length()) {
+                    val a = assets.getJSONObject(i)
+                    if (a.getString("name").endsWith(".apk")) { apkUrl = a.getString("browser_download_url"); break }
+                }
+                runOnUiThread { onUpdateInfo(tag, notes, apkUrl, manual) }
+            } catch (e: Exception) {
+                if (manual) runOnUiThread { toast("Update check failed: ${e.message}") }
+            }
+        }.start()
+    }
+
+    private fun onUpdateInfo(tag: String, notes: String, apkUrl: String?, manual: Boolean) {
+        if (!isNewer(tag, versionName)) {
+            if (manual) toast("You're up to date (v$versionName)")
+            return
+        }
+        if (apkUrl == null) {
+            if (manual) toast("$tag has no APK attached yet - the build may still be running")
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Update available: $tag")
+            .setMessage("Installed: v$versionName\n\n" + notes.take(500))
+            .setPositiveButton("Download & install") { _, _ -> downloadUpdate(apkUrl) }
+            .setNegativeButton("Later", null)
+            .show()
+    }
+
+    private fun downloadUpdate(url: String) {
+        if (!packageManager.canRequestPackageInstalls()) {
+            toast("Allow installing from this app, then tap \"Check for updates\" again")
+            startActivity(
+                Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName"))
+            )
+            return
+        }
+        File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "update.apk").delete()
+        val req = DownloadManager.Request(Uri.parse(url))
+            .setTitle("Figma Wrapper update")
+            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+            .setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, "update.apk")
+        downloadId = (getSystemService(DOWNLOAD_SERVICE) as DownloadManager).enqueue(req)
+        toast("Downloading update\u2026")
+    }
+
+    private val downloadReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+            if (id == -1L || id != downloadId) return
+            val dm = getSystemService(DOWNLOAD_SERVICE) as DownloadManager
+            dm.query(DownloadManager.Query().setFilterById(id)).use { c ->
+                if (!c.moveToFirst() ||
+                    c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS)) != DownloadManager.STATUS_SUCCESSFUL
+                ) {
+                    toast("Update download failed")
+                    return
+                }
+            }
+            installDownloadedApk()
+        }
+    }
+
+    private fun installDownloadedApk() {
+        val file = File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "update.apk")
+        if (!file.exists()) { toast("Downloaded file not found"); return }
+        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+        startActivity(
+            Intent(Intent.ACTION_VIEW)
+                .setDataAndType(uri, "application/vnd.android.package-archive")
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
     }
 
     // ---------------------------------------------------------------- stylus handling
@@ -540,7 +789,7 @@ class MainActivity : AppCompatActivity() {
     private fun shortcutFor(e: KeyEvent): (() -> Unit)? {
         val ctrl = e.isCtrlPressed || e.isMetaPressed
         val shift = e.isShiftPressed
-        if (e.keyCode == KeyEvent.KEYCODE_F5 && !ctrl) return act { current?.webView?.reload() }
+        if (e.keyCode == KeyEvent.KEYCODE_F5 && !ctrl) return act { reloadCurrent() }
         if (!ctrl || e.isAltPressed) return null
 
         return when (e.keyCode) {
