@@ -2,7 +2,7 @@
 
 Personal-use multi-tab WebView wrapper around figma.com. Not affiliated with Figma.
 
-## Build
+<!--## Build
 1. Push this folder to your GitHub repo (yeftani000/Figma-Android).
 2. Every push builds a signed APK (Actions tab -> artifact `figma-wrapper-apk`).
 
@@ -28,6 +28,7 @@ Updates only install over each other if every build is signed with the same key.
    - `KEY_ALIAS` = `figmawrapper` (or your alias)
    - `KEY_PASSWORD` = the key password you chose
 Tag (release) builds fail on purpose if the secrets are missing. Normal pushes still build, with a throwaway key.
+-->
 
 ## Tabs
 - Pinned **Home** tab (figma.com/files). Clicking a file there opens it in a new tab.
